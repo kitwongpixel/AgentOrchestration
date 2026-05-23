@@ -1,12 +1,46 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
-from src.agent import AgentRegistry, AgentStatus
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel, Field
+
+from src.agent import AgentRegistry
+from src.agent.registry import AgentStatus
+from .webhooks import WebhookError, webhooks
 
 router = APIRouter()
 registry = AgentRegistry()
+
+
+class WebhookSubscriptionCreate(BaseModel):
+    endpoint: str
+    filters: List[str] = Field(default_factory=list)
+
+
+class WebhookEndpointUpdate(BaseModel):
+    endpoint: str
+
+
+class WebhookDeliveryCreate(BaseModel):
+    endpoint: str
+    delivery_id: str
+    event: Dict[str, object] = Field(default_factory=dict)
+
+
+def _workspace_context(
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-ID"),
+    x_workspace_role: Optional[str] = Header(default=None, alias="X-Workspace-Role"),
+) -> tuple[str, str]:
+    if not x_workspace_id:
+        raise HTTPException(status_code=401, detail="Missing workspace context")
+    if not x_workspace_role:
+        raise HTTPException(status_code=403, detail="Missing workspace role")
+    return x_workspace_id, x_workspace_role
+
+
+def _webhook_error(error: WebhookError) -> HTTPException:
+    return HTTPException(status_code=error.status_code, detail=error.message)
 
 
 @router.get("/agents")
@@ -53,6 +87,121 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/webhooks/subscriptions")
+async def create_webhook_subscription(
+    payload: WebhookSubscriptionCreate,
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-ID"),
+    x_workspace_role: Optional[str] = Header(default=None, alias="X-Workspace-Role"),
+):
+    workspace_id, role = _workspace_context(x_workspace_id, x_workspace_role)
+    try:
+        subscription = webhooks.register_subscription(
+            workspace_id=workspace_id,
+            role=role,
+            endpoint=payload.endpoint,
+            filters=payload.filters,
+        )
+    except WebhookError as error:
+        raise _webhook_error(error)
+    return {
+        "subscription_id": subscription.subscription_id,
+        "workspace_id": subscription.workspace_id,
+        "endpoint": subscription.endpoint,
+        "filters": subscription.filters,
+        "active": subscription.active,
+        "rotated": subscription.rotated,
+    }
+
+
+@router.get("/webhooks/subscriptions/{subscription_id}")
+async def get_webhook_subscription(
+    subscription_id: str,
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-ID"),
+    x_workspace_role: Optional[str] = Header(default=None, alias="X-Workspace-Role"),
+):
+    workspace_id, role = _workspace_context(x_workspace_id, x_workspace_role)
+    try:
+        subscription = webhooks._get_owned_subscription(subscription_id, workspace_id, role)
+    except WebhookError as error:
+        raise _webhook_error(error)
+    return {
+        "subscription_id": subscription.subscription_id,
+        "workspace_id": subscription.workspace_id,
+        "endpoint": subscription.endpoint,
+        "filters": subscription.filters,
+        "active": subscription.active,
+        "rotated": subscription.rotated,
+        "delivery_count": len(subscription.deliveries),
+    }
+
+
+@router.post("/webhooks/subscriptions/{subscription_id}/deliver")
+async def deliver_webhook_event(
+    subscription_id: str,
+    payload: WebhookDeliveryCreate,
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-ID"),
+    x_workspace_role: Optional[str] = Header(default=None, alias="X-Workspace-Role"),
+):
+    workspace_id, role = _workspace_context(x_workspace_id, x_workspace_role)
+    try:
+        return webhooks.deliver_event(
+            workspace_id=workspace_id,
+            role=role,
+            subscription_id=subscription_id,
+            endpoint=payload.endpoint,
+            delivery_id=payload.delivery_id,
+            event=payload.event,
+        )
+    except WebhookError as error:
+        raise _webhook_error(error)
+
+
+@router.post("/webhooks/subscriptions/{subscription_id}/disable")
+async def disable_webhook_subscription(
+    subscription_id: str,
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-ID"),
+    x_workspace_role: Optional[str] = Header(default=None, alias="X-Workspace-Role"),
+):
+    workspace_id, role = _workspace_context(x_workspace_id, x_workspace_role)
+    try:
+        subscription = webhooks.disable_subscription(
+            workspace_id=workspace_id,
+            role=role,
+            subscription_id=subscription_id,
+        )
+    except WebhookError as error:
+        raise _webhook_error(error)
+    return {
+        "subscription_id": subscription.subscription_id,
+        "active": subscription.active,
+        "rotated": subscription.rotated,
+    }
+
+
+@router.post("/webhooks/subscriptions/{subscription_id}/rotate")
+async def rotate_webhook_subscription(
+    subscription_id: str,
+    payload: WebhookEndpointUpdate,
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-ID"),
+    x_workspace_role: Optional[str] = Header(default=None, alias="X-Workspace-Role"),
+):
+    workspace_id, role = _workspace_context(x_workspace_id, x_workspace_role)
+    try:
+        subscription = webhooks.rotate_subscription_endpoint(
+            workspace_id=workspace_id,
+            role=role,
+            subscription_id=subscription_id,
+            new_endpoint=payload.endpoint,
+        )
+    except WebhookError as error:
+        raise _webhook_error(error)
+    return {
+        "subscription_id": subscription.subscription_id,
+        "endpoint": subscription.endpoint,
+        "rotated": subscription.rotated,
+    }
 
 # 2019-03-18T11:10:18 update
 
