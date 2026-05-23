@@ -12,11 +12,10 @@ def client():
     return TestClient(create_app())
 
 
-def headers(workspace_id="workspace-a", role="workspace:operator"):
+def headers(workspace_id="workspace-a"):
     return {
         "Authorization": "Bearer test-token",
         "X-Workspace-ID": workspace_id,
-        "X-Workspace-Role": role,
     }
 
 
@@ -199,3 +198,42 @@ def test_missing_workspace_context_is_denied():
     )
 
     assert response.status_code == 401
+
+
+def test_missing_auth_header_is_denied_before_webhook_handling():
+    http = client()
+    response = http.post(
+        "/api/v2/webhooks/subscriptions",
+        json={
+            "endpoint": "https://hooks.example.com/a",
+            "filters": ["event_id"],
+        },
+        headers={"X-Workspace-ID": "workspace-a"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_https_endpoint_required_before_persistence():
+    http = client()
+    response = http.post(
+        "/api/v2/webhooks/subscriptions",
+        json={
+            "endpoint": "http://hooks.example.com/a",
+            "filters": ["event_id"],
+        },
+        headers=headers(),
+    )
+
+    assert response.status_code == 400
+    assert "https://" in response.json()["detail"]
+
+
+def test_unknown_subscription_returns_not_found():
+    http = client()
+    response = http.get(
+        "/api/v2/webhooks/subscriptions/not-a-real-id",
+        headers=headers(),
+    )
+
+    assert response.status_code == 404

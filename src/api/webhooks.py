@@ -22,12 +22,6 @@ INTERNAL_ONLY_FIELDS: Set[str] = {
     "database_id",
 }
 
-ALLOWED_WORKSPACE_ROLES: Set[str] = {
-    "workspace:owner",
-    "workspace:operator",
-}
-
-
 class WebhookError(Exception):
     def __init__(self, status_code: int, message: str):
         super().__init__(message)
@@ -60,11 +54,9 @@ class WebhookService:
     def clear(self) -> None:
         self._subscriptions.clear()
 
-    def _require_workspace_access(self, workspace_id: Optional[str], role: Optional[str]) -> None:
+    def _require_workspace_access(self, workspace_id: Optional[str]) -> None:
         if not workspace_id:
             raise WebhookError(401, "Missing workspace context")
-        if role not in ALLOWED_WORKSPACE_ROLES:
-            raise WebhookError(403, "Insufficient workspace role")
 
     def _validate_filters(self, filters: List[str]) -> None:
         invalid = [field for field in filters if field not in ALLOWED_FILTER_FIELDS]
@@ -79,11 +71,10 @@ class WebhookService:
         self,
         *,
         workspace_id: str,
-        role: str,
         endpoint: str,
         filters: Optional[List[str]] = None,
     ) -> WebhookSubscription:
-        self._require_workspace_access(workspace_id, role)
+        self._require_workspace_access(workspace_id)
         self._validate_endpoint(endpoint)
         filters = filters or []
         self._validate_filters(filters)
@@ -104,10 +95,9 @@ class WebhookService:
         self,
         *,
         workspace_id: str,
-        role: str,
         subscription_id: str,
     ) -> WebhookSubscription:
-        subscription = self._get_owned_subscription(subscription_id, workspace_id, role)
+        subscription = self._get_owned_subscription(subscription_id, workspace_id)
         subscription.active = False
         return subscription
 
@@ -115,11 +105,10 @@ class WebhookService:
         self,
         *,
         workspace_id: str,
-        role: str,
         subscription_id: str,
         new_endpoint: str,
     ) -> WebhookSubscription:
-        subscription = self._get_owned_subscription(subscription_id, workspace_id, role)
+        subscription = self._get_owned_subscription(subscription_id, workspace_id)
         self._validate_endpoint(new_endpoint)
         subscription.endpoint = new_endpoint
         subscription.rotated = True
@@ -129,13 +118,12 @@ class WebhookService:
         self,
         *,
         workspace_id: str,
-        role: str,
         subscription_id: str,
         endpoint: str,
         delivery_id: str,
         event: Dict[str, Any],
     ) -> Dict[str, Any]:
-        subscription = self._get_owned_subscription(subscription_id, workspace_id, role)
+        subscription = self._get_owned_subscription(subscription_id, workspace_id)
         self._validate_endpoint(endpoint)
 
         if not subscription.active:
@@ -174,9 +162,8 @@ class WebhookService:
         self,
         subscription_id: str,
         workspace_id: str,
-        role: Optional[str],
     ) -> WebhookSubscription:
-        self._require_workspace_access(workspace_id, role)
+        self._require_workspace_access(workspace_id)
         subscription = self._subscriptions.get(subscription_id)
         if subscription is None:
             raise WebhookError(404, "Webhook subscription not found")
