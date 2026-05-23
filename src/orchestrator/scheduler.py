@@ -3,7 +3,8 @@
 import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from threading import RLock
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -33,53 +34,146 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._active_dedupe_keys: Dict[str, str] = {}
+        self._audit_log: List[Dict[str, Any]] = []
+        self._lock = RLock()
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def _task_dedupe_key(self, task: Dict[str, Any]) -> Optional[str]:
+        return task.get("cron_tick_id") or task.get("dedupe_key")
 
+    def _record_decision(self, action: str, task: Dict[str, Any], queue: str, reason: str) -> None:
+        entry = {
+            "action": action,
+            "task_id": task.get("id"),
+            "queue": queue,
+            "reason": reason,
+            "dedupe_key": self._task_dedupe_key(task),
+            "timestamp": time.time(),
+        }
+        self._audit_log.append(entry)
+        if len(self._audit_log) > 100:
+            self._audit_log.pop(0)
+
+    def _register_dedupe_key(self, task_id: str, task: Dict[str, Any]) -> None:
+        dedupe_key = self._task_dedupe_key(task)
+        if dedupe_key:
+            self._active_dedupe_keys[dedupe_key] = task_id
+
+    def _release_dedupe_key(self, task_id: str) -> None:
+        keys = [key for key, current_task_id in self._active_dedupe_keys.items() if current_task_id == task_id]
+        for key in keys:
+            self._active_dedupe_keys.pop(key, None)
+
+    def _queue_task(self, task: Dict[str, Any], queue: str, priority: int) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
+        task["queue"] = queue
+        task["priority"] = priority
+        task["enqueued_at"] = time.time()
         self._queues[queue].push(task, priority)
-        return task_id
+
+    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+        with self._lock:
+            task = dict(task)
+            task_id = task.get("id") or str(uuid4())
+            dedupe_key = self._task_dedupe_key(task)
+            active_task_id = self._active_dedupe_keys.get(dedupe_key) if dedupe_key else None
+            if active_task_id and active_task_id != task_id:
+                self._record_decision(
+                    "deferred_duplicate",
+                    {"id": task_id, **task},
+                    queue,
+                    "dedupe key already active",
+                )
+                return active_task_id
+
+            task["id"] = task_id
+            task["retries"] = task.get("retries", 0)
+            self._queue_task(task, queue, priority)
+            self._register_dedupe_key(task_id, task)
+            self._record_decision("enqueued", task, queue, "accepted")
+            return task_id
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
+        with self._lock:
+            task = dict(task)
+            task_id = task.get("id") or str(uuid4())
+            dedupe_key = self._task_dedupe_key(task)
+            active_task_id = self._active_dedupe_keys.get(dedupe_key) if dedupe_key else None
+            if active_task_id and active_task_id != task_id:
+                self._record_decision(
+                    "deferred_duplicate",
+                    {"id": task_id, **task},
+                    queue,
+                    "dedupe key already active",
+                )
+                return active_task_id
+
+            task["id"] = task_id
+            task["scheduled_at"] = time.time()
+            task["due_at"] = task["scheduled_at"] + delay
+            task["retries"] = task.get("retries", 0)
+            task["queue"] = queue
+            task["priority"] = priority
+            self._scheduled[task_id] = {
+                "task": task,
+                "queue": queue,
+                "priority": priority,
+                "due_at": task["due_at"],
+            }
+            self._register_dedupe_key(task_id, task)
+            self._record_decision("scheduled", task, queue, "accepted")
+            return task_id
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+        with self._lock:
+            now = time.time()
+            expired = [tid for tid, entry in self._scheduled.items() if entry["due_at"] <= now]
+            for tid in expired:
+                entry = self._scheduled.pop(tid)
+                task = entry["task"]
+                self._queue_task(task, entry["queue"], entry["priority"])
+                self._record_decision("promoted", task, entry["queue"], "scheduled task is now ready")
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
-        return None
+            if queue in self._queues and len(self._queues[queue]) > 0:
+                task = self._queues[queue].pop()
+                if task:
+                    self._in_flight[task["id"]] = task
+                    self._record_decision("dequeued", task, queue, "task moved to in-flight")
+                    return task
+            return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if task is None:
+                return False
+            self._release_dedupe_key(task_id)
+            self._record_decision("completed", task, task.get("queue", "default"), "task finished")
+            return True
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if not task:
+                return False
+
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._queue_task(task, queue, priority=task.get("priority", 0))
+                self._record_decision("requeued", task, queue, "retry scheduled")
                 return True
-        return False
+
+            self._release_dedupe_key(task_id)
+            self._record_decision("dropped", task, queue, "retry limit reached")
+            return False
+
+    def decisions(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._audit_log)
 
 # 2019-04-25T08:37:12 update
 

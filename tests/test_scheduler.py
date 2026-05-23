@@ -36,6 +36,41 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_schedule_promotes_due_task(self):
+        self.scheduler.schedule({"type": "cron"}, delay=-1, queue="default", priority=4)
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert task["type"] == "cron"
+        assert task["priority"] == 4
+
+    def test_duplicate_cron_tick_is_deduplicated(self):
+        first_id = self.scheduler.schedule(
+            {"type": "cron", "cron_tick_id": "tick-42"},
+            delay=0,
+            queue="default",
+            priority=1,
+        )
+        second_id = self.scheduler.schedule(
+            {"type": "cron", "cron_tick_id": "tick-42"},
+            delay=0,
+            queue="default",
+            priority=1,
+        )
+
+        assert second_id == first_id
+        assert len(self.scheduler._scheduled) == 1
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert task["cron_tick_id"] == "tick-42"
+
+        assert any(
+            decision["action"] == "deferred_duplicate"
+            for decision in self.scheduler.decisions()
+        )
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
