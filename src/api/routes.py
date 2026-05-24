@@ -4,9 +4,14 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.data.exports import ExportError, ExportFilterRequest, export_jobs
 
 router = APIRouter()
 registry = AgentRegistry()
+
+
+def _export_error(error: ExportError) -> HTTPException:
+    return HTTPException(status_code=error.status_code, detail=error.message)
 
 
 @router.get("/agents")
@@ -53,6 +58,34 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/exports", status_code=201)
+async def create_export_job(payload: ExportFilterRequest):
+    try:
+        job = export_jobs.submit_export_job(
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+            workspace_id=payload.workspace_id,
+            statuses=payload.statuses,
+        )
+    except ExportError as error:
+        raise _export_error(error)
+    return job.to_dict()
+
+
+@router.get("/exports")
+async def list_export_jobs():
+    return {"jobs": [job.to_dict() for job in export_jobs.list_jobs()]}
+
+
+@router.get("/exports/{job_id}")
+async def get_export_job(job_id: str):
+    job = export_jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    return job.to_dict()
+
 
 # 2019-03-18T11:10:18 update
 
